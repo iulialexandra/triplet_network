@@ -3,7 +3,8 @@ import tools.utils as util
 from models.siamese_engine import SiameseEngine
 import os
 import data_processing.dataset_utils as dat
-
+import os
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
 
 def main(args):
     plotting = False
@@ -34,10 +35,10 @@ def main(args):
     args.left_classif_factor = 0.7
     args.right_classif_factor = 0.7
     args.siamese_factor = 1.
-    args.seed = 4
+    args.seed = 1
     args.dataset = "tiny-imagenet"
-    args.model = "HorizontalNetworkV5"
-    args.data_path = "/media/iulialexandra/data/siamese_cluster_new/data"
+    args.model = "TripletV1"
+    args.data_path = "/Users/waylana/Google Drive/PhD /my content/data/tfrecs"
 
     if args.dataset == "mnist":
         args.image_dims = (28, 28, 1)
@@ -58,7 +59,8 @@ def main(args):
     args, logger = util.initialize_experiment(args, train=True)
     dataset_info = dat.read_dataset_csv(args.dataset_path, args.num_train_classes, args.num_val_ways)
     siamese = SiameseEngine(args)
-    siamese.train(dataset_info)
+    # siamese.train(dataset_info)
+    siamese.train_triplet(dataset_info)
 
 
 def parse_args():
@@ -147,9 +149,12 @@ def parse_args():
     argparser.add_argument('--dataset',
                            help="The dataset of choice", type=str,
                            default="roshambo")
+    argparser.add_argument('--triplet_strategy',
+                           help="How to selects triplets", type=str,
+                           default="batch_all")
     argparser.add_argument('--data_path',
                            help="Path to data", type=str,
-                           default="/media/iulialexandra/data/siamese_cluster_new/data")
+                           default="/media/iulialexandra/data/siamese_data_results/tfrecs")
     return argparser.parse_args()
 
 
@@ -168,8 +173,23 @@ if __name__ == "__main__":
         args.image_dims = (64, 64, 3)
     elif args.dataset == "mini-imagenet":
         args.image_dims = (84, 84, 3)
+    elif args.dataset == "tiny-resnet101":
+        args.image_dims = [1, 8192]
+    elif args.dataset == "tiny-resnet50":
+        args.image_dims = [2, 2, 2048]
+    elif args.dataset == "tiny-simclr-r101":
+        args.image_dims = [2048]
+    elif args.dataset == "tiny-simclr-r152":
+        args.image_dims = [2048]
+    elif args.dataset == "tiny-simclr-r50":
+        args.image_dims = [2048]
+    elif args.dataset == "tiny-resnet50":
+        args.image_dims = [2, 2, 2048]
+    elif args.dataset == "tiny-resnet101":
+        args.image_dims = [1, 8192]
     else:
         print(" Dataset not supported.")
 
     args.dataset_path = os.path.join(args.data_path, args.dataset)
+    args = parse_args()
     main(args)

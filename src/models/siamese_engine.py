@@ -2,6 +2,7 @@ import os
 import logging
 import numpy.random as rng
 import numpy as np
+from tqdm import tqdm
 import time
 from signal import SIGINT, SIGTERM
 import tensorflow as tf
@@ -11,7 +12,6 @@ import data_processing.dataset_utils as dat
 import keras.backend as K
 from keras.utils import to_categorical
 from collections import namedtuple
-from sklearn.metrics import confusion_matrix
 from collections import defaultdict
 from contextlib import redirect_stdout
 from keras.optimizers import Adam
@@ -19,6 +19,8 @@ from tools.modified_sgd import Modified_SGD
 from networks.horizontal_nets import *
 from networks.original_nets import *
 from networks.resnets import *
+from networks.triplet_nets import *
+from models.triplet_loss import *
 
 logger = logging.getLogger("siam_logger")
 
@@ -29,7 +31,7 @@ class SiameseEngine():
         self.num_epochs = args.num_epochs
         self.evaluate_every = args.evaluate_every
         self.results_path = args.results_path
-        self.model = args.model
+        self.model_name = args.model
         self.num_val_ways = args.num_val_ways
         self.num_shots = args.num_shots
         self.num_val_trials = args.num_val_trials
@@ -46,6 +48,7 @@ class SiameseEngine():
         self.momentum_slope = args.momentum_slope
         self.final_momentum = args.final_momentum
         self.optimizer = args.optimizer
+        self.triplet_strategy = args.triplet_strategy
         self.save_weights = args.save_weights
         self.checkpoint = args.checkpoint
         self.left_classif_factor = args.left_classif_factor
@@ -73,29 +76,24 @@ class SiameseEngine():
 
     def setup_network(self, num_classes):
         if self.optimizer == 'sgd':
-            optimizer = Modified_SGD(
+            self.optimizer = Modified_SGD(
                 lr=self.learning_rate,
                 momentum=0.5)
         elif self.optimizer == 'adam':
-            optimizer = Adam(self.learning_rate)
+            self.optimizer = Adam(self.learning_rate)
         else:
             raise ("optimizer not known")
 
-        model = util.str_to_class(self.model)
-        siamese_network = model(self.image_dims, optimizer,
-                                self.left_classif_factor,
-                                self.right_classif_factor,
-                                self.siamese_factor)
-        self.net = siamese_network.build_net(num_classes)
-
+        model_class = util.str_to_class(self.model_name)
+        siamese_network = model_class(self.image_dims, self.optimizer)
+        self.embeddings, self.model = siamese_network.build_net()
         with open(os.path.join(self.results_path, 'modelsummary.txt'), 'w') as f:
             with redirect_stdout(f):
-                self.net.summary()
-
+                self.model.summary()
         if self.checkpoint:
-            self.net.load_weights(os.path.join(self.checkpoint, "weights.h5"))
+            self.model.load_weights(os.path.join(self.checkpoint, "weights.h5"))
 
-    def train(self, dat_info):
+    def train_triplet(self, dat_info):
         self.num_train_cls = len(dat_info.train_class_indices)
         self.setup_network(self.num_train_cls)
         sess = tf.Session()
@@ -115,83 +113,63 @@ class SiameseEngine():
         test_labels_left, test_labels_right = self.setup_test_input(sess, dat_info.test_class_indices, test_table,
                                                                     dat_info.num_test_samples, dat_info.test_filenames)
 
-        with util.Uninterrupt(sigs=[SIGINT, SIGTERM], verbose=True) as u:
-            for epoch in range(self.num_epochs):
-                sess.run(train_iterator.initializer)
-                batch_index = 0
-                train_metrics = defaultdict(list)
-                logger.info("Training epoch {} ...".format(epoch))
-                while True:
-                    try:
-                        train_ims, train_labs = sess.run([train_image_batch, train_label_batch])
-                        # deals with unequal tf record lengths, when the batch might have samples
-                        # from only one class
-                        if len(np.unique(train_labs)) < 2 or \
-                                len(np.unique(train_labs)) > self.batch_size // 2:
-                            continue
+        labels = tf.cast(train_label_batch, tf.int64)
+        train_batch = tf.cast(train_image_batch, tf.float32)
 
-                        left_images, right_images, left_labels, siamese_targets, right_labels \
-                            = self._get_train_balanced_batch(train_ims, train_labs, self.num_train_cls)
+        if self.triplet_strategy == "batch_all":
+            loss, fraction = batch_all_triplet_loss(labels, self.model(train_batch), margin=0.5,
+                                                    squared=False)
+        elif self.triplet_strategy == "batch_hard":
+            loss = batch_hard_triplet_loss(labels, self.model(train_batch), margin=0.5,
+                                           squared=False)
+        else:
+            raise ValueError("Triplet strategy not recognized: {}".format(self.triplet_strategy))
 
-                        metrics = self.net.train_on_batch(x={"Left_input": left_images,
-                                                             "Right_input": right_images},
-                                                          y={"Left_branch_classification":
-                                                                 left_labels,
-                                                             "Siamese_classification":
-                                                                 siamese_targets,
-                                                             "Right_branch_classification":
-                                                                 right_labels})
+        # Summaries for training
+        tf.summary.scalar('loss', loss)
+        if self.triplet_strategy == "batch_all":
+            tf.summary.scalar('fraction_positive_triplets', fraction)
+        tf.summary.image('train_image', train_batch, max_outputs=1)
 
-                        for idx, metric in enumerate(metrics):
-                            train_metrics[self.net.metrics_names[idx]].append(metric)
+        updates_op = self.optimizer.get_updates(
+            params=self.model.trainable_weights,
+            loss=loss)
 
-                        batch_index += 1
+        train = K.function(
+            inputs=[train_batch, labels],
+            outputs=[loss],
+            updates=updates_op)
 
-                    except tf.errors.OutOfRangeError:
-                        if self.lr_annealing:
-                            K.set_value(self.net.optimizer.lr, K.get_value(
-                                self.net.optimizer.lr) * 0.99)
+        for epoch in range(self.num_epochs):
+            sess.run(train_iterator.initializer)
+            batch_index = 0
+            logger.info("Training epoch {} ...".format(epoch))
+            losses_train = []
+            while True:
+                try:
+                    train_ims, train_labs = sess.run([train_batch, labels])
+                    # deals with unequal tf record lengths, when the batch might have samples
+                    # from only one class
+                    if len(np.unique(train_labs)) < 2 or \
+                            len(np.unique(train_labs)) > self.batch_size // 2:
+                        continue
 
-                        if self.momentum_annealing and self.optimizer == 'sgd':
-                            if K.get_value(self.net.optimizer.momentum) < self.final_momentum:
-                                K.set_value(self.net.optimizer.momentum, K.get_value(
-                                    self.net.optimizer.momentum) + self.momentum_slope)
+                    loss_train = train([K.constant(train_ims), K.constant(train_labs)])
+                    losses_train.append(loss_train[0])
+                    batch_index += 1
 
-                        if epoch % self.evaluate_every == 0:
-                            self.validate(epoch, batch_index, train_metrics, left_images, right_images,
-                                          siamese_targets, val_inputs, val_targets, val_targets_one_hot,
-                                          dat_info.val_class_names, val_labels_left, val_labels_right, test_inputs,
-                                          test_targets, test_targets_one_hot, dat_info.test_class_names,
-                                          test_labels_left, test_labels_right)
-
-                        break
-                if u.interrupted:
-                    logger.info("Interrupted on request, doing one last evaluation")
-                    self.validate(epoch, batch_index, train_metrics, left_images, right_images,
-                                  siamese_targets, val_inputs, val_targets, val_targets_one_hot,
-                                  dat_info.val_class_names, val_labels_left, val_labels_right, test_inputs,
-                                  test_targets, test_targets_one_hot, dat_info.test_class_names,
-                                  test_labels_left, test_labels_right)
+                except tf.errors.OutOfRangeError:
+                    print(np.mean(losses_train))
+                    if epoch % self.evaluate_every == 0:
+                        self.validate(epoch, batch_index, val_inputs, val_targets, val_targets_one_hot,
+                                      dat_info.val_class_names, val_labels_left, val_labels_right, test_inputs,
+                                      test_targets, test_targets_one_hot, dat_info.test_class_names,
+                                      test_labels_left, test_labels_right)
                     break
 
-    def validate(self, epoch, batch_index, train_metrics, left_images, right_images,
-                 siamese_targets, val_inputs, val_targets, val_targets_one_hot,
+    def validate(self, epoch, batch_index, val_inputs, val_targets, val_targets_one_hot,
                  val_class_names, val_labels_left, val_labels_right, test_inputs, test_targets,
                  test_targets_one_hot, test_class_names, test_labels_left, test_labels_right):
-
-        left_loss = np.mean(train_metrics["Left_branch_classification_loss"])
-        left_acc = np.mean(train_metrics["Left_branch_classification_acc"])
-        right_loss = np.mean(train_metrics["Right_branch_classification_loss"])
-        right_acc = np.mean(train_metrics["Right_branch_classification_acc"])
-        siamese_loss = np.mean(train_metrics["Siamese_classification_loss"])
-        siamese_acc = np.mean(train_metrics["Siamese_classification_acc"])
-
-        logger.info("Left branch classification training loss and accuracy at the end of"
-                    " epoch {}: {}, {}".format(epoch, left_loss, left_acc * 100))
-        logger.info("Right branch classification training loss and accuracy at the end of"
-                    " epoch {}: {}, {}".format(epoch, right_loss, right_acc * 100))
-        logger.info("Siamese classification training loss and accuracy at the end of epoch"
-                    " {}: {}, {}".format(epoch, siamese_loss, siamese_acc * 100))
 
         epoch_folder = os.path.join(self.results_path, "epoch_{}".format(epoch))
         if not os.path.exists(epoch_folder):
@@ -211,77 +189,19 @@ class SiameseEngine():
                     "".format(self.num_val_ways, self.num_shots, eval_test.siam_accuracy * 100, test_class_names))
 
         util.metrics_to_csv(os.path.join(epoch_folder, "metrics_epoch_{}.csv".format(epoch)),
-                            np.asarray([left_loss, left_acc, right_loss, right_acc, siamese_loss, siamese_acc,
-                                        eval_val.siam_accuracy, eval_test.siam_accuracy, eval_val.left_accuracy,
+                            np.asarray([eval_val.siam_accuracy, eval_test.siam_accuracy, eval_val.left_accuracy,
                                         eval_val.right_accuracy]),
-                            ["left_loss", "left_acc", "right_loss", "right_acc", "siamese_loss", "siamese_acc",
-                             "siamese_val_accuracy", "siamese_test_accuracy", "val_left_accuracy", "val_right_accuracy"]
+                            ["siamese_val_accuracy", "siamese_test_accuracy", "val_left_accuracy", "val_right_accuracy"]
                             )
 
         if self.save_weights:
             # self.net.save_weights(os.path.join(self.results_path, "weights.h5"))
-            self.net.save(os.path.join(self.results_path, "weights.h5"), overwrite=True, include_optimizer=False)
+            self.model.save(os.path.join(self.results_path, "weights.h5"), overwrite=True, include_optimizer=False)
 
         if self.write_to_tensorboard:
-            self._write_logs_to_tensorboard(batch_index, left_loss, left_acc, right_loss, right_acc,
-                                            siamese_loss, siamese_acc, eval_val.siam_accuracy, eval_test.siam_accuracy,
+            self._write_logs_to_tensorboard(batch_index, eval_val.siam_accuracy, eval_test.siam_accuracy,
                                             eval_test.siam_probs_std, eval_test.siam_probs_means)
-        if epoch == 0:
-            if self.plot_training_images:
-                for b, batch_sample in enumerate(siamese_targets):
-                    vis.plot_siamese_training_pairs(os.path.join(
-                        self.results_path,
-                        "siamese_training_sample_{}"
-                        "".format(b)),
-                        [left_images[b], right_images[b]], siamese_targets[b])
 
-            if self.plot_val_images:
-                for im in range(100):
-                    vis.plot_validation_images(os.path.join(
-                        self.results_path,
-                        "siamese_validation_sample_{}.png"
-                        "".format(im)),
-                        [val_inputs[0][im], val_inputs[1][im]],
-                        val_targets_one_hot[im])
-
-            if self.plot_test_images:
-                for im in range(100):
-                    vis.plot_validation_images(os.path.join(
-                        self.results_path,
-                        "siamese_test_sample_{}.png"
-                        "".format(im)),
-                        [test_inputs[0][im], test_inputs[1][im]],
-                        test_targets_one_hot[im])
-
-        else:
-            if self.plot_wrong_preds:
-                val_incorrect_idx = np.where(eval_val.interm_preds == 0)[0]
-                for im in range(min(100, len(val_incorrect_idx))):
-                    vis.plot_wrong_preds(os.path.join(epoch_folder,
-                                                      "siamese_val_incorrect_sample_{}.png"
-                                                      "".format(im)),
-                                         [val_inputs[0][val_incorrect_idx[im]],
-                                          val_inputs[1][val_incorrect_idx[im]]],
-                                         val_targets_one_hot[val_incorrect_idx[im]],
-                                         eval_val.siamese_preds[val_incorrect_idx[im]])
-                test_incorrect_idx = np.where(eval_test.interm_preds == 0)[0]
-                for im in range(min(100, len(test_incorrect_idx))):
-                    vis.plot_wrong_preds(os.path.join(epoch_folder,
-                                                      "siamese_test_incorrect_sample_{}.png"
-                                                      "".format(im)),
-                                         [test_inputs[0][test_incorrect_idx[im]],
-                                          test_inputs[1][test_incorrect_idx[im]]],
-                                         test_targets_one_hot[
-                                             test_incorrect_idx[im]],
-                                         eval_test.siamese_preds[test_incorrect_idx[im]])
-
-        if self.plot_confusion:
-            cnf_matrix = confusion_matrix(val_targets, eval_val.siamese_preds)
-            vis.plot_confusion_matrix(epoch_folder, "val", cnf_matrix,
-                                      classes=range(self.num_val_ways))
-            cnf_matrix = confusion_matrix(test_targets, eval_test.siamese_preds)
-            vis.plot_confusion_matrix(epoch_folder, "test", cnf_matrix,
-                                      classes=range(self.num_val_ways))
 
     def test(self,dat_info):
         num_train_cls = len(dat_info.train_class_indices)
@@ -313,7 +233,7 @@ class SiameseEngine():
 
         for trial in range(self.num_val_trials):
             for s in range(self.num_shots):
-                probs = self.net.predict([inps[0][trial, :, s], inps[1][trial, :, s]])
+                probs = self.model.predict([inps[0][trial, :, s], inps[1][trial, :, s]])
                 # if trial < 5:
                 #     vis.plot_validation_images(
                 #         "/media/iulialexandra/Storage/code/low-shot/siamese_on_edge/results/val_images_shot{}.png".format(s),
@@ -351,22 +271,22 @@ class SiameseEngine():
             chosen_indices = rng.choice(range(len(labels)), size=self.batch_size, replace=False)
             left_labels = labels[chosen_indices]
             right_labels = []
-            image_pairs[:, 0, :, :, :] = images[chosen_indices]
+            image_pairs[:, 0, ...] = images[chosen_indices]
             for i, index in enumerate(chosen_indices):
                 comparative_lbl = labels[index]
                 if targets[i] == 0:
                     pair_index = rng.choice(np.where(labels != comparative_lbl)[0], size=(1,))[0]
-                    image_pairs[i, 1, :, :, :] = images[pair_index]
+                    image_pairs[i, 1, ...] = images[pair_index]
                     right_labels.append(labels[pair_index])
                 elif targets[i] == 1:
                     pair_index = rng.choice(np.where(labels == comparative_lbl)[0], size=(1,))[0]
-                    image_pairs[i, 1, :, :, :] = images[pair_index]
+                    image_pairs[i, 1, ...] = images[pair_index]
                     right_labels.append(labels[pair_index])
             right_labels = np.array(right_labels)
             right_labels = to_categorical(right_labels, num_classes=num_train_cls)
             left_labels = to_categorical(left_labels, num_classes=num_train_cls)
 
-            return (image_pairs[:, 0, :, :, :], image_pairs[:, 1, :, :, :],
+            return (image_pairs[:, 0, ...], image_pairs[:, 1, ...],
                     left_labels, np.expand_dims(targets, 1), right_labels)
 
     def _make_kshot_task(self, n_val_tasks, image_data, labels, n_ways):
@@ -388,8 +308,8 @@ class SiameseEngine():
                 cls_indices = np.where(labels == cls)[0]
                 comparison_indices[:, i] = rng.choice(cls_indices, size=(n_val_tasks, self.num_shots),
                                                       replace=True)
-            comparison_images = image_data[comparison_indices, :, :, :]
-            reference_images = image_data[reference_indices, np.newaxis, np.newaxis, :, :, :]
+            comparison_images = image_data[comparison_indices, ...]
+            reference_images = image_data[reference_indices, np.newaxis, np.newaxis, ...]
             reference_images = np.repeat(reference_images, n_ways, axis=1)
             reference_images = np.repeat(reference_images, self.num_shots, axis=2)
             image_pairs = [np.array(reference_images, dtype=np.float32),
