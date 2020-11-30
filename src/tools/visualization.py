@@ -5,7 +5,7 @@ import seaborn as sns
 import itertools
 import tensorflow as tf
 from skimage.transform import resize
-
+import matplotlib.patheffects as PathEffects
 
 def plot_validation_images(plots_path, images, target):
     width, height, ch = images[0][0].shape
@@ -266,3 +266,42 @@ def plot_pred_diffs(path, type, pred_diffs):
     fig.savefig(os.path.join(path, "{}_prediction_differences.png".format({type})),
                 bbox_inches='tight', dpi=300)
     plt.close("all")
+
+
+def scatter(x, labels, mode, epoch, path):
+    # We choose a color palette with seaborn.
+
+    embeds_plots_folder = os.path.join(path, "tsne_embeds")
+    if not os.path.exists(embeds_plots_folder):
+        os.makedirs(embeds_plots_folder)
+
+    unique_labs = np.unique(labels)
+    num_labs = len(unique_labs)
+    mapped_labs = np.array([np.where(unique_labs == a)[0][0] for a in labels])
+    palette = np.array(sns.color_palette("hls", num_labs))
+
+    # We create a scatter plot.
+    f = plt.figure(figsize=(8, 8))
+    ax = plt.subplot(aspect='equal')
+    sc = ax.scatter(x[:, 0], x[:, 1], lw=0, s=40,
+                    c=palette[mapped_labs.astype(np.int)])
+    plt.xlim(-25, 25)
+    plt.ylim(-25, 25)
+    ax.axis('off')
+    ax.axis('tight')
+
+    # We add the labels for each digit.
+    txts = []
+    for i in range(num_labs):
+        # Position of each label.
+        xtext, ytext = np.median(x[mapped_labs == i, :], axis=0)
+        txt = ax.text(xtext, ytext, str(i), fontsize=24)
+        txt.set_path_effects([
+            PathEffects.Stroke(linewidth=5, foreground="w"),
+            PathEffects.Normal()])
+        txts.append(txt)
+
+    subtitle = "TSNE for {} classes, epoch {}".format(mode, epoch)
+    plt.suptitle(subtitle)
+    plt.show()
+    plt.savefig(os.path.join(embeds_plots_folder, "{}_classes_epoch_{}".format(mode, str(epoch))))

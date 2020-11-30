@@ -9,6 +9,7 @@ import tensorflow as tf
 import tools.utils as util
 import tools.visualization as vis
 import data_processing.dataset_utils as dat
+from sklearn.manifold import TSNE
 import keras.backend as K
 from keras.utils import to_categorical
 from collections import namedtuple
@@ -113,14 +114,13 @@ class SiameseEngine():
         test_labels_left, test_labels_right = self.setup_test_input(sess, dat_info.test_class_indices, test_table,
                                                                     dat_info.num_test_samples, dat_info.test_filenames)
 
-        labels = tf.cast(train_label_batch, tf.int64)
-        train_batch = tf.cast(train_image_batch, tf.float32)
+        predictions_train = self.model(train_image_batch)
 
         if self.triplet_strategy == "batch_all":
-            loss, fraction = batch_all_triplet_loss(labels, self.model(train_batch), margin=0.5,
+            loss, fraction = batch_all_triplet_loss(train_label_batch, predictions_train, margin=0.5,
                                                     squared=False)
         elif self.triplet_strategy == "batch_hard":
-            loss = batch_hard_triplet_loss(labels, self.model(train_batch), margin=0.5,
+            loss = batch_hard_triplet_loss(train_label_batch, predictions_train, margin=0.5,
                                            squared=False)
         else:
             raise ValueError("Triplet strategy not recognized: {}".format(self.triplet_strategy))
@@ -129,16 +129,21 @@ class SiameseEngine():
         tf.summary.scalar('loss', loss)
         if self.triplet_strategy == "batch_all":
             tf.summary.scalar('fraction_positive_triplets', fraction)
-        tf.summary.image('train_image', train_batch, max_outputs=1)
+        tf.summary.image('train_image', train_image_batch, max_outputs=1)
 
         updates_op = self.optimizer.get_updates(
             params=self.model.trainable_weights,
             loss=loss)
 
         train = K.function(
-            inputs=[train_batch, labels],
+            inputs=[train_image_batch, train_label_batch],
             outputs=[loss],
             updates=updates_op)
+
+        self.validate(0, 0, val_inputs, val_targets, val_targets_one_hot,
+                      dat_info.val_class_names, val_labels_left, val_labels_right, test_inputs,
+                      test_targets, test_targets_one_hot, dat_info.test_class_names,
+                      test_labels_left, test_labels_right)
 
         for epoch in range(self.num_epochs):
             sess.run(train_iterator.initializer)
@@ -147,20 +152,18 @@ class SiameseEngine():
             losses_train = []
             while True:
                 try:
-                    train_ims, train_labs = sess.run([train_batch, labels])
+                    train_ims, train_labs = sess.run([train_image_batch, train_label_batch])
                     # deals with unequal tf record lengths, when the batch might have samples
                     # from only one class
                     if len(np.unique(train_labs)) < 2 or \
                             len(np.unique(train_labs)) > self.batch_size // 2:
                         continue
-
-                    loss_train = train([K.constant(train_ims), K.constant(train_labs)])
+                    loss_train = train([train_ims, train_labs])
                     losses_train.append(loss_train[0])
                     batch_index += 1
-
                 except tf.errors.OutOfRangeError:
                     print(np.mean(losses_train))
-                    if epoch % self.evaluate_every == 0:
+                    if (epoch+1) % self.evaluate_every == 0:
                         self.validate(epoch, batch_index, val_inputs, val_targets, val_targets_one_hot,
                                       dat_info.val_class_names, val_labels_left, val_labels_right, test_inputs,
                                       test_targets, test_targets_one_hot, dat_info.test_class_names,
@@ -175,32 +178,26 @@ class SiameseEngine():
         if not os.path.exists(epoch_folder):
             os.makedirs(epoch_folder)
 
-        eval_val = self.eval(val_inputs, val_targets, val_targets_one_hot, val_class_names, val_labels_left, val_labels_right)
-
+        eval_val = self.eval("validation", epoch, val_inputs, val_targets, val_targets_one_hot, val_class_names,
+                             val_labels_left, val_labels_right)
         logger.info("Siamese {} way {}-shot accuracy on known classes: {}% on classes {}"
                     "".format(self.num_val_ways, self.num_shots, eval_val.siam_accuracy * 100, val_class_names))
-        logger.info("Left classifier {} way accuracy: {}%"
-                    "".format(self.num_val_ways, eval_val.left_accuracy * 100))
-        logger.info("Right classifier {} way accuracy: {}%"
-                    "".format(self.num_val_ways, eval_val.right_accuracy * 100))
 
-        eval_test = self.eval(test_inputs, test_targets, test_targets_one_hot, test_class_names, test_labels_left, test_labels_right)
+        eval_test = self.eval("test", epoch, test_inputs, test_targets, test_targets_one_hot, test_class_names,
+                              test_labels_left, test_labels_right)
         logger.info("Siamese {} way {}-shot accuracy on novel classes: {}% on classes {}"
                     "".format(self.num_val_ways, self.num_shots, eval_test.siam_accuracy * 100, test_class_names))
 
         util.metrics_to_csv(os.path.join(epoch_folder, "metrics_epoch_{}.csv".format(epoch)),
-                            np.asarray([eval_val.siam_accuracy, eval_test.siam_accuracy, eval_val.left_accuracy,
-                                        eval_val.right_accuracy]),
-                            ["siamese_val_accuracy", "siamese_test_accuracy", "val_left_accuracy", "val_right_accuracy"]
-                            )
+                            np.asarray([eval_val.siam_accuracy, eval_test.siam_accuracy]),
+                            ["siamese_val_accuracy", "siamese_test_accuracy"])
 
         if self.save_weights:
             # self.net.save_weights(os.path.join(self.results_path, "weights.h5"))
             self.model.save(os.path.join(self.results_path, "weights.h5"), overwrite=True, include_optimizer=False)
 
         if self.write_to_tensorboard:
-            self._write_logs_to_tensorboard(batch_index, eval_val.siam_accuracy, eval_test.siam_accuracy,
-                                            eval_test.siam_probs_std, eval_test.siam_probs_means)
+            self._write_logs_to_tensorboard(batch_index, eval_val.siam_accuracy, eval_test.siam_accuracy)
 
 
     def test(self,dat_info):
@@ -220,45 +217,42 @@ class SiameseEngine():
         util.metrics_to_csv(os.path.join(self.results_path, "inference.csv"), np.asarray([eval_results.siam_accuracy]),
                             ["test_acc"])
 
-    def eval(self, inps, targets, targets_one_hot, class_names, eval_labels_left, eval_labels_right):
+    def eval(self, mode, epoch, inps, targets, targets_one_hot, class_names, eval_labels_left, eval_labels_right):
         logger.info(
             "Evaluating model on {} random {} way one-shot learning tasks from classes {}"
             "...".format(self.num_val_trials, self.num_val_ways, class_names))
 
         siamese_preds = np.zeros((self.num_val_trials, self.num_shots))
-        siam_probs_std = np.zeros((self.num_val_trials, self.num_shots))
-        siam_probs_means = np.zeros((self.num_val_trials, self.num_shots))
-        left_preds = np.zeros((self.num_val_trials, self.num_val_ways, self.num_shots))
-        right_preds = np.zeros((self.num_val_trials, self.num_val_ways, self.num_shots))
 
         for trial in range(self.num_val_trials):
             for s in range(self.num_shots):
-                probs = self.model.predict([inps[0][trial, :, s], inps[1][trial, :, s]])
+                embeddings_left = self.model.predict(inps[0][trial, :, s])
+                embeddings_right = self.model.predict(inps[1][trial, :, s])
+                import scipy
                 # if trial < 5:
                 #     vis.plot_validation_images(
                 #         "/media/iulialexandra/Storage/code/low-shot/siamese_on_edge/results/val_images_shot{}.png".format(s),
                 #                                [inps[0][trial, :, s], inps[1][trial, :, s]], targets_one_hot[trial, :, s])
-                left_probs = probs[0]
-                siamese_probs = probs[1]
-                right_probs = probs[2]
-                siamese_preds[trial, s] = np.argmax(siamese_probs)
+                dists = []
                 for way in range(self.num_val_ways):
-                    left_preds[trial, way, s] = np.argmax(left_probs[way])
-                    right_preds[trial, way, s] = np.argmax(right_probs[way])
-                siam_probs_std[trial, s] = np.std(siamese_probs)
-                siam_probs_means[trial, s] = np.mean(siamese_probs)
-
-        left_acc = np.equal(left_preds, eval_labels_left)
-        right_acc = np.equal(right_preds, eval_labels_right)
+                    dists.append(scipy.spatial.distance.euclidean(embeddings_left[way], embeddings_right[way]))
+                siamese_preds[trial, s] = np.argmin(dists)
         interm_siam_acc = np.equal(siamese_preds, targets)
-        tolerance = siam_probs_std > 10e-8
-        interm_preds = np.logical_and(interm_siam_acc, tolerance)
         siam_accuracy = np.mean(interm_siam_acc)
-        EvalResults = namedtuple("EvalResults", ["siam_accuracy", "siamese_preds", "interm_preds",
-                                                 "siam_probs_std", "siam_probs_means", "left_accuracy",
-                                                 "right_accuracy"])
-        return EvalResults(siam_accuracy, siamese_preds, interm_preds, siam_probs_std, siam_probs_means,
-                           np.mean(left_acc), np.mean(right_acc))
+        EvalResults = namedtuple("EvalResults", ["siam_accuracy"])
+        self.plot_emb_tsne(inps, eval_labels_left, mode, epoch)
+        return EvalResults(siam_accuracy)
+
+    def plot_emb_tsne(self, inputs, labels, mode, epoch):
+        num_trials = 100
+        tsne = TSNE()
+        embeddings = []
+        labs = np.ravel(labels[:num_trials])
+        for trial in range(num_trials):
+            embeddings.append(self.model.predict(np.squeeze(inputs[0][trial])))
+        embs = np.vstack(embeddings)
+        tsne_embeds = tsne.fit_transform(embs)
+        vis.scatter(tsne_embeds, labs, mode, epoch, self.results_path)
 
     def _get_train_balanced_batch(self, images, labels, num_train_cls):
         with tf.device('/cpu:0'):

@@ -17,27 +17,31 @@ class TripletV1:
         net_input = Input(shape=self.input_shape, name="network_input")
 
         block_name = "block1"
-        conv0 = Conv2D(8, (9, 9), padding="same", activation='relu',
+        conv0 = Conv2D(32, (9, 9), padding="same", activation='relu',
                        kernel_initializer="he_normal", name='{}_conv0'.format(block_name),
                        kernel_regularizer=l2(1e-2))(net_input)
         conv0 = BatchNormalization(name='{}_conv0_batchnorm'.format(block_name))(conv0)
 
-        conv1 = Conv2D(8, (7, 7), padding="same", activation='relu',
+        conv1 = Conv2D(64, (7, 7), padding="same", activation='relu',
                        kernel_initializer="he_normal", name='{}_conv1'.format(block_name),
                        kernel_regularizer=l2(1e-2))(conv0)
         conv1 = BatchNormalization(name='{}_conv1_batchnorm'.format(block_name))(conv1)
 
-        conv2 = Conv2D(8, (5, 5), padding="same", activation='relu',
+        conv2 = Conv2D(128, (5, 5), padding="same", activation='relu',
                        kernel_initializer="he_normal", name='{}_conv2'.format(block_name),
                        kernel_regularizer=l2(1e-2))(conv1)
         conv2 = BatchNormalization(name='{}_conv2_batchnorm'.format(block_name))(conv2)
 
-        conv3 = Conv2D(8, (3, 3), padding="same", activation='relu',
+        conv3 = Conv2D(256, (3, 3), padding="same", activation='relu',
                        kernel_initializer="he_normal", name='{}_conv3'.format(block_name),
                        kernel_regularizer=l2(1e-2))(conv2)
         conv3 = BatchNormalization(name='{}_conv3_batchnorm'.format(block_name))(conv3)
-
-        net = MaxPooling2D(padding="valid")(conv3)
+        conv3 = MaxPooling2D(padding="valid")(conv3)
+        conv4 = Conv2D(128, (3, 3), padding="same", activation='relu',
+                       kernel_initializer="he_normal", name='{}_conv4'.format(block_name),
+                       kernel_regularizer=l2(1e-2))(conv3)
+        conv4 = BatchNormalization(name='{}_conv4_batchnorm'.format(block_name))(conv4)
+        net = MaxPooling2D(padding="valid")(conv4)
         net = Flatten()(net)
         embedding = Dense(64, activation=None, kernel_regularizer=l2(1e-2),
               kernel_initializer="he_normal", name='fc1')(net)

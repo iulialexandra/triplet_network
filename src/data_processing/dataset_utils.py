@@ -169,7 +169,7 @@ def parser(record, new_labels_dict, image_dims, resize_dims):
 
         image_shape = tf.stack(list(image_dims))
         image = tf.decode_raw(features["image_raw"], tf.uint8)
-        image = tf.cast(image, tf.float16)
+        image = tf.cast(image, tf.float32)
         image = tf.scalar_mul(1 / (2 ** 8), image)
         image = tf.reshape(image, image_shape)
 

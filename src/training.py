@@ -22,7 +22,7 @@ def main(args):
     args.num_shots = 1
     args.evaluate_every = 10
     args.n_val_tasks = 1000
-    args.batch_size = 32
+    args.batch_size = 64
 
     args.final_momentum = 0.9
     args.momentum_slope = 0.01
@@ -38,7 +38,7 @@ def main(args):
     args.seed = 1
     args.dataset = "tiny-imagenet"
     args.model = "TripletV1"
-    args.data_path = "/Users/waylana/Google Drive/PhD /my content/data/tfrecs"
+    args.data_path = "/media/iulialexandra/data/siamese_data_results/tfrecs"
 
     if args.dataset == "mnist":
         args.image_dims = (28, 28, 1)
